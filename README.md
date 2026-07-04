@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="assets/halo.svg" width="112" alt="Halo" />
+
 # Halo
 
 **A screen recorder that automatically zooms and pans to follow the action.**
@@ -68,8 +70,8 @@ src-tauri/binaries/ffmpeg-x86_64-pc-windows-msvc.exe
 ## Getting started
 
 ```bash
-git clone https://github.com/cyborgsuh/screen-recorder.git
-cd screen-recorder
+git clone https://github.com/cyborgsuh/halo.git
+cd halo
 npm install
 
 # add ffmpeg (see above), then:
