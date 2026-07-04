@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Halo</title>
+  </head>
+  <body>
+    <script>
+      // Overlay windows (#recbar / #campreview) are transparent, but index.css
+      // paints an opaque body bg and React clears it only after mount. Clear it
+      // at parse time so a window shown before React mounts never flashes a square.
+      if (location.hash === "#recbar" || location.hash === "#campreview") {
+        document.documentElement.style.background = "transparent";
+        document.body.style.background = "transparent";
+      }
+    </script>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

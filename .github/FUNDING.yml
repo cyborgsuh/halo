@@ -1,0 +1,7 @@
+# Shows a "Sponsor" button on the GitHub repo.
+# Enable GitHub Sponsors for the cyborgsuh account first: https://github.com/sponsors
+github: [cyborgsuh]
+# Uncomment and fill any you use:
+# ko_fi: your_handle
+# buy_me_a_coffee: your_handle
+# custom: ["https://your-site.example/donate"]
