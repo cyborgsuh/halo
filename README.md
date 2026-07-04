@@ -125,13 +125,6 @@ timeline math) has assert-based tests:
 npm test
 ```
 
-## Support
-
-Halo is free and MIT-licensed. If it's useful to you and you'd like to support
-development, it's welcome (never required):
-
-**[❤️ Sponsor on GitHub](https://github.com/sponsors/cyborgsuh)** &nbsp;·&nbsp; **[☕ Buy Me a Coffee](https://buymeacoffee.com/cyborgsuh)**
-
 ## License
 
 [MIT](LICENSE) © cyborgsuh — free for personal and commercial use.
