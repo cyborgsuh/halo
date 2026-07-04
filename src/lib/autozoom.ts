@@ -47,6 +47,36 @@ export interface CursorSample {
   btn: MouseButton;
 }
 
+// ── cursor.jsonl I/O helpers (shared by Recorder, Editor and export) ─────────
+
+/** cursor.jsonl lives beside the screen recording; swap the trailing filename. */
+export function cursorPathFor(screenPath: string): string {
+  const i = Math.max(screenPath.lastIndexOf("/"), screenPath.lastIndexOf("\\"));
+  return i < 0 ? "cursor.jsonl" : screenPath.slice(0, i + 1) + "cursor.jsonl";
+}
+
+/** Parse cursor.jsonl (one JSON object per line) into cursor samples. */
+export function parseCursorLog(text: string): CursorSample[] {
+  const out: CursorSample[] = [];
+  for (const line of text.split("\n")) {
+    const s = line.trim();
+    if (!s) continue;
+    try {
+      const o = JSON.parse(s) as CursorSample;
+      if (
+        typeof o.t === "number" &&
+        typeof o.x === "number" &&
+        typeof o.y === "number"
+      ) {
+        out.push({ t: o.t, x: o.x, y: o.y, btn: o.btn ?? null });
+      }
+    } catch {
+      /* skip malformed line */
+    }
+  }
+  return out;
+}
+
 // ── Algorithm ────────────────────────────────────────────────────────────────
 
 /**

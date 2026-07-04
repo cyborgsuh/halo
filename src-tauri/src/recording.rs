@@ -420,6 +420,10 @@ pub fn list_recordings(app: AppHandle) -> Result<Vec<RecordingMeta>, String> {
     let Ok(entries) = std::fs::read_dir(&base) else {
         return Ok(Vec::new());
     };
+    // A dir whose session is still LIVE has a growing screen.mp4 — it is not a
+    // finished recording and must not show as a library card mid-capture.
+    let active: std::collections::HashSet<String> =
+        with_sessions(|m| m.keys().cloned().collect());
     let mut out: Vec<RecordingMeta> = Vec::new();
     for e in entries.flatten() {
         let dir = e.path();
@@ -431,6 +435,9 @@ pub fn list_recordings(app: AppHandle) -> Result<Vec<RecordingMeta>, String> {
             Some(n) => n.to_string(),
             None => continue,
         };
+        if active.contains(&id) {
+            continue;
+        }
         let created_ms = e
             .metadata()
             .and_then(|m| m.modified())

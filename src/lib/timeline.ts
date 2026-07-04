@@ -137,10 +137,10 @@ export interface CursorFollow {
 /** Default cursor-follow tuning applied to fresh/loaded projects. */
 export const DEFAULT_CURSOR_FOLLOW: CursorFollow = {
   strength: 0.68,
-  // Window-follow holds still inside this zone (it no longer center-chases),
-  // so a wider default kills drift-chatter; clicks still land dead-center via
-  // the post-click centering window.
-  deadzonePct: 10,
+  // Center-chase engages once the cursor strays this far from the camera
+  // center; hysteresis (FOLLOW_REARM) kills boundary chatter, so the deadzone
+  // can stay small and tracking tight.
+  deadzonePct: 5,
 };
 
 /** Export render settings. */
@@ -447,11 +447,12 @@ export function normalizeProject(p: Project): Project {
 // Scale comes from the zoom regions (sampleZoomAt); PAN is decoupled and
 // follows the cursor. The cursor data is fully recorded, so the follow target
 // is evaluated at a LEAD time — the camera anticipates instead of trailing.
-// Per output sample: window-follow target (move only enough to keep the
-// cursor inside the deadzone; hold otherwise; recenter fully for a beat after
-// each click) → clamp to the ×2 viewport margin (decelerate INTO the frame
-// edge) → critically-damped spring. Deterministic per tMs so scrubbing and
-// export agree.
+// Per output sample: hysteresis CENTER-CHASE (once the cursor leaves the
+// deadzone the target is the cursor ITSELF, so it lands dead-centered; the
+// chase disengages only after the camera converges, latching the target —
+// no stop-start chatter at the boundary) → clamp to the ×2 viewport margin
+// (decelerate INTO the frame edge) → critically-damped spring. Deterministic
+// per tMs so scrubbing and export agree.
 // ===========================================================================
 
 // ── Follow tunables (named knobs — calibrate on real recordings) ────────────
@@ -463,11 +464,13 @@ export function normalizeProject(p: Project): Project {
  */
 export const FOLLOW_LOOKAHEAD_MS = 250;
 /**
- * For this long after a click the target is the cursor ITSELF (not the
- * window), so clicks land dead-center. Kept inside the post-click zoom hold
- * (ZOOM_HOLD_MS = 1200) so centering never outlives the zoom.
+ * Hysteresis re-arm fraction: while chasing, the target keeps tracking the
+ * cursor until the camera center has closed to within dz * FOLLOW_REARM of
+ * it, then the target LATCHES (holds where it is) until the cursor leaves
+ * the deadzone again. Engage at dz, disengage at 0.35*dz → no stop-start
+ * chatter at the boundary.
  */
-export const CLICK_CENTER_MS = 900;
+const FOLLOW_REARM = 0.35;
 /**
  * Follow-target clamp margin: the viewport half-extent at the ×2 auto-zoom
  * (0.5/2). Clamping the TARGET lets the spring decelerate into the frame edge
@@ -488,13 +491,11 @@ export const FOLLOW_OMEGA_MAX = 12;
 
 // ── Follow types ────────────────────────────────────────────────────────────
 
-/** Minimal cursor sample shape the follow math needs (t, source-px x/y).
- *  `btn` is optional — when present, "down" samples drive click-centering. */
+/** Minimal cursor sample shape the follow math needs (t, source-px x/y). */
 export interface FollowInputSample {
   t: number;
   x: number;
   y: number;
-  btn?: "down" | "up" | null;
 }
 
 /** One precomputed follow center: normalized (cx,cy) at source time `t`. */
@@ -519,19 +520,6 @@ function isSortedByT(samples: FollowInputSample[]): boolean {
 }
 
 /**
- * Window-follow target on one axis. Inside the central margin `dz` the center
- * holds (kills micro-jitter from human hand tremor); outside it, the target
- * moves JUST enough to bring the cursor back to the deadzone edge — continuous
- * at |cursor - center| = dz, so the camera never rubber-band snaps. Clicks
- * land dead-center via the separate click-centering window, not here.
- */
-export function followTarget(center: number, cursor: number, dz: number): number {
-  const d = cursor - center;
-  if (Math.abs(d) <= dz) return center;
-  return cursor - Math.sign(d) * dz;
-}
-
-/**
  * Edge-guard: clamp a normalized follow center so the 1/scale viewport stays
  * fully inside the source frame. Shared by the renderer's per-frame transform
  * and the follow self-check.
@@ -551,17 +539,14 @@ export function clampFollowCenter(
 /**
  * Precompute the follow-pan path from raw cursor samples.
  *
- *  - `samples` carry source-pixel x/y (a superset of CursorSample is fine;
- *    `btn === "down"` samples drive click-centering when present).
+ *  - `samples` carry source-pixel x/y (a superset of CursorSample is fine).
  *  - `w`,`h` are the source frame dims used to normalize to 0..1.
  *  - `follow` supplies `strength` (spring stiffness) and `deadzonePct`.
  *
  * Per output sample at time t everything is evaluated at the LEAD time
- * tL = t + FOLLOW_LOOKAHEAD_MS: window-follow target (or the cursor itself
- * within CLICK_CENTER_MS of a click) → viewport-margin clamp → critically-
- * damped spring. Click pre-arrival falls out automatically: centering starts
- * FOLLOW_LOOKAHEAD_MS before the real click, and its expiry hands off
- * snap-free because the window target holds the current center.
+ * tL = t + FOLLOW_LOOKAHEAD_MS: hysteresis center-chase target (see loop) →
+ * viewport-margin clamp → critically-damped spring. The camera centers the
+ * cursor whenever it moves meaningfully and sits dead-still on hand tremor.
  */
 export function computeFollowPath(
   samples: FollowInputSample[],
@@ -600,30 +585,47 @@ export function computeFollowPath(
     const u = span <= 0 ? 0 : clamp01((t - a.t) / span);
     return { x: lerp(a.x, b.x, u), y: lerp(a.y, b.y, u) };
   };
-  // Click pointer, also forward-only: lastClickT = latest "down" at/before tL.
-  let k = 0;
-  let lastClickT = -Infinity;
 
   let cx = clampN(clamp01(sorted[0].x / w), lo, hi);
   let cy = clampN(clamp01(sorted[0].y / h), lo, hi);
   let vx = 0;
   let vy = 0;
+  // Center-chase hysteresis, per axis: engaged = actively chasing the cursor.
+  let fx = false;
+  let fy = false;
+  // Latched targets — they only move while their axis is engaged, so a settle
+  // completes onto the cursor's true position (no deadzone-edge offset).
+  let tx = cx;
+  let ty = cy;
   let prevT = sorted[0].t;
   out.push({ t: prevT, cx, cy });
 
   for (let i = 1; i < n; i++) {
     const s = sorted[i];
     const tL = s.t + FOLLOW_LOOKAHEAD_MS;
-    while (k < n && sorted[k].t <= tL) {
-      if (sorted[k].btn === "down") lastClickT = sorted[k].t;
-      k++;
-    }
     const lead = leadAt(tL);
     const nx = clamp01(lead.x / w);
     const ny = clamp01(lead.y / h);
-    const centering = tL - lastClickT <= CLICK_CENTER_MS;
-    const tx = clampN(centering ? nx : followTarget(cx, nx, dz), lo, hi);
-    const ty = clampN(centering ? ny : followTarget(cy, ny, dz), lo, hi);
+
+    // Engage when the (lead) cursor leaves the deadzone around the camera
+    // center, then chase the cursor ITSELF (dead-centering, the classic feel);
+    // disengage only once the center has converged, latching the target.
+    const gx = Math.abs(nx - cx);
+    if (!fx) {
+      if (gx > dz) fx = true;
+    } else if (gx < dz * FOLLOW_REARM) {
+      fx = false;
+    }
+    if (fx) tx = nx;
+    const gy = Math.abs(ny - cy);
+    if (!fy) {
+      if (gy > dz) fy = true;
+    } else if (gy < dz * FOLLOW_REARM) {
+      fy = false;
+    }
+    if (fy) ty = ny;
+    const txC = clampN(tx, lo, hi);
+    const tyC = clampN(ty, lo, hi);
 
     // Critically-damped spring (zeta = 1) integrated to the target — buttery,
     // natural glide with NO overshoot. Substep so large frame gaps stay stable.
@@ -631,8 +633,8 @@ export function computeFollowPath(
     const steps = Math.max(1, Math.ceil(dt / 0.008));
     const hStep = dt / steps;
     for (let m = 0; m < steps; m++) {
-      const ax = omega * omega * (tx - cx) - 2 * omega * vx;
-      const ay = omega * omega * (ty - cy) - 2 * omega * vy;
+      const ax = omega * omega * (txC - cx) - 2 * omega * vx;
+      const ay = omega * omega * (tyC - cy) - 2 * omega * vy;
       vx += ax * hStep;
       vy += ay * hStep;
       cx += vx * hStep;

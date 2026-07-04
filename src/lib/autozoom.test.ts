@@ -1,8 +1,8 @@
 // Run: npx tsx src/lib/autozoom.test.ts
 // Pins the pure motion math behind the premium auto-zoom feel: click-region
-// merge/split, the continuous window-follow target, look-ahead pan, click
-// pre-arrival/centering, jitter hold, soft edge deceleration, and the spring
-// zoom ramp. Rendering is visual (integration); this is the logic that breaks.
+// merge/split, hysteresis center-chase pan (with look-ahead), jitter hold,
+// soft edge deceleration, the spring zoom ramp, and the playback clock.
+// Rendering is visual (integration); this is the logic that breaks.
 
 import assert from "node:assert";
 import {
@@ -15,7 +15,6 @@ import {
   computeFollowPath,
   sampleFollowAt,
   sampleZoomAt,
-  followTarget,
   tickPlayClock,
   type CursorFollow,
   type PlayClock,
@@ -95,17 +94,6 @@ t("degenerates: empty, no clicks, click at t=0", () => {
   assert.equal(r[0].startMs, 0);
 });
 
-// ── Window-follow target ─────────────────────────────────────────────────────
-
-t("followTarget is continuous at the deadzone boundary", () => {
-  const dz = 0.05;
-  assert.equal(followTarget(0.5, 0.5 + dz, dz), 0.5); // at boundary: hold
-  const justOut = followTarget(0.5, 0.5 + dz + 1e-4, dz);
-  assert.ok(Math.abs(justOut - (0.5 + 1e-4)) < 1e-12); // moves just enough
-  assert.equal(followTarget(0.5, 0.52, dz), 0.5); // inside: hold
-  assert.equal(followTarget(0.5, 0.3, dz), 0.3 + dz); // below: symmetric
-});
-
 // ── Follow path: look-ahead, centering, jitter, edges ────────────────────────
 
 t("look-ahead: camera moves before the raw cursor does", () => {
@@ -120,19 +108,33 @@ t("look-ahead: camera moves before the raw cursor does", () => {
   assert.ok(sampleFollowAt(path, 1450).cx > 0.5005);
 });
 
-t("click pre-arrival: camera is centered on the click point by click time", () => {
-  // Click at x=0.7 — inside the ×2 viewport margin, so dead-centering is
-  // reachable. Window-follow alone would stop DZ short at 0.65.
-  const s = mkSamples(
-    4000,
-    (tt) => {
-      const u = Math.min(1, Math.max(0, (tt - 1500) / 400));
-      return { x: 0.5 + 0.2 * u, y: 0.5 };
-    },
-    [2200],
-  );
+t("center-chase: a settled cursor ends dead-centered (not deadzone-trailing)", () => {
+  // Sweep 0.5 → 0.7 then hold. Window-follow used to park dz short at 0.65;
+  // center-chasing must converge onto the cursor itself.
+  const s = mkSamples(4000, (tt) => {
+    const u = Math.min(1, Math.max(0, (tt - 1500) / 400));
+    return { x: 0.5 + 0.2 * u, y: 0.5 };
+  });
   const path = computeFollowPath(s, W, H, FOLLOW);
-  assert.ok(Math.abs(sampleFollowAt(path, 2200).cx - 0.7) < 0.03);
+  const settled = sampleFollowAt(path, 3800).cx;
+  assert.ok(Math.abs(settled - 0.7) < 0.01, `settled at ${settled}`);
+});
+
+t("hysteresis: sub-deadzone wiggle after convergence holds; a real move re-engages", () => {
+  const pos = (tt: number) => {
+    if (tt < 500) return { x: 0.5, y: 0.5 };
+    if (tt < 2500) return { x: 0.6, y: 0.5 }; // step beyond dz → chase + center
+    if (tt < 4000) return { x: 0.62, y: 0.5 }; // wiggle inside dz → hold
+    return { x: 0.7, y: 0.5 }; // beyond dz again → re-engage
+  };
+  const s = mkSamples(6000, pos);
+  const path = computeFollowPath(s, W, H, FOLLOW);
+  const converged = sampleFollowAt(path, 2400).cx;
+  assert.ok(Math.abs(converged - 0.6) < 0.01, `converged at ${converged}`);
+  // Sample before the 250ms lookahead horizon reaches the 4000ms move.
+  const held = sampleFollowAt(path, 3600).cx;
+  assert.ok(Math.abs(held - converged) < 0.005, `crept: ${converged} -> ${held}`);
+  assert.ok(Math.abs(sampleFollowAt(path, 5900).cx - 0.7) < 0.01);
 });
 
 t("clicks past the ×2 viewport margin settle AT the margin (no edge slam)", () => {

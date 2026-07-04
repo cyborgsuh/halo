@@ -22,7 +22,12 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import type { Project } from "./timeline";
-import { createRenderer, type Renderer, type SourceFrame } from "./renderer";
+import {
+  createRenderer,
+  type CursorSample,
+  type Renderer,
+  type SourceFrame,
+} from "./renderer";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public types
@@ -96,6 +101,11 @@ interface ExportCommon {
   outPath: string;
   /** Optional webcam bubble source. */
   camera?: ExportCamera | null;
+  /**
+   * Cursor samples (cursor.jsonl) — drive the pan-follow so exported zooms
+   * track the mouse exactly like the editor preview. Omit → centered zoom.
+   */
+  cursor?: CursorSample[];
   /** Cancel mid-export. */
   signal?: AbortSignal;
   /** Progress notifications. */
@@ -381,6 +391,7 @@ interface EncodeParams {
   project: Project;
   source: ExportSource;
   camera?: ExportCamera | null;
+  cursor?: CursorSample[];
   width: number;
   height: number;
   fps: number;
@@ -442,7 +453,13 @@ async function encodeRange(params: EncodeParams): Promise<EncodeResult> {
     width,
     height,
     offscreen: true,
+    // Feed the cursor path so the pan-follow tracks the mouse — same pure
+    // computeFollowPath as the editor preview, so export matches it exactly.
+    cursor: params.cursor,
   });
+  // The REAL cursor is baked into screen.mp4 — never draw the synthetic sprite
+  // on exports (setCursor above enables it as a side effect).
+  renderer.setCursorVisible(false);
 
   const parts: Uint8Array[] = [];
   let total = 0;
@@ -594,6 +611,7 @@ export async function exportVideo(opts: ExportVideoOptions): Promise<string> {
     project: opts.project,
     source: opts.source,
     camera: opts.camera,
+    cursor: opts.cursor,
     width,
     height,
     fps,
@@ -657,6 +675,7 @@ export async function exportGif(opts: ExportGifOptions): Promise<string> {
     project: opts.project,
     source: opts.source,
     camera: opts.camera,
+    cursor: opts.cursor,
     width,
     height,
     fps: gifFps,

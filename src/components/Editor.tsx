@@ -23,12 +23,9 @@ import {
 import { Card } from "@/components/ui/card";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { useAppStore } from "@/store";
-import {
-  createRenderer,
-  type CursorSample,
-  type Renderer,
-} from "@/lib/renderer";
+import { createRenderer, type Renderer } from "@/lib/renderer";
 import { readTextFile } from "@/lib/capture";
+import { cursorPathFor, parseCursorLog } from "@/lib/autozoom";
 import { cutEndAt, tickPlayClock, type PlayClock } from "@/lib/timeline";
 
 import Timeline from "@/components/Timeline";
@@ -36,34 +33,6 @@ import Inspector from "@/components/Inspector";
 
 function videoReady(v: HTMLVideoElement | null): v is HTMLVideoElement {
   return !!v && v.readyState >= 2 && v.videoWidth > 0;
-}
-
-/** cursor.jsonl lives beside the screen recording; swap the trailing filename. */
-function cursorPathFor(screenPath: string): string {
-  const i = Math.max(screenPath.lastIndexOf("/"), screenPath.lastIndexOf("\\"));
-  return i < 0 ? "cursor.jsonl" : screenPath.slice(0, i + 1) + "cursor.jsonl";
-}
-
-/** Parse cursor.jsonl (one JSON object per line) into renderer cursor samples. */
-function parseCursorLog(text: string): CursorSample[] {
-  const out: CursorSample[] = [];
-  for (const line of text.split("\n")) {
-    const s = line.trim();
-    if (!s) continue;
-    try {
-      const o = JSON.parse(s) as CursorSample;
-      if (
-        typeof o.t === "number" &&
-        typeof o.x === "number" &&
-        typeof o.y === "number"
-      ) {
-        out.push({ t: o.t, x: o.x, y: o.y, btn: o.btn ?? null });
-      }
-    } catch {
-      /* skip malformed line */
-    }
-  }
-  return out;
 }
 
 // Source <video>s feed the GPU texture. They must be RENDERED (not display:none) or
@@ -89,6 +58,14 @@ export default function Editor() {
   const micAudioRef = useRef<HTMLAudioElement | null>(null);
   const rendererRef = useRef<Renderer | null>(null);
   const playheadRef = useRef(0);
+  // Play clock lives in a ref (not effect-local) so seek() can re-anchor it —
+  // otherwise mid-play scrubs fight the slew + monotonic clamp. seek() REPLACES
+  // the object, so the loop must read the ref fresh every tick.
+  const playClockRef = useRef<PlayClock>({ anchorPerf: 0, anchorMs: 0, lastT: 0 });
+  // Our own video seeks in flight: don't trust the video clock until 'seeked'
+  // lands — a stale currentTime would read as huge drift and hard-resync the
+  // playhead back to the pre-seek position.
+  const seekPendingRef = useRef(false);
   const reconciledRef = useRef<string | null>(null);
 
   const [ready, setReady] = useState(false);
@@ -232,14 +209,18 @@ export default function Editor() {
   useEffect(() => {
     const sv = screenVideoRef.current;
     if (!sv) return;
-    const onFrame = () => {
+    const onSeeked = () => {
+      seekPendingRef.current = false; // our seek landed — trust the video clock again
       if (!playing) paint();
     };
-    sv.addEventListener("seeked", onFrame);
-    sv.addEventListener("loadeddata", onFrame);
+    const onLoaded = () => {
+      if (!playing) paint();
+    };
+    sv.addEventListener("seeked", onSeeked);
+    sv.addEventListener("loadeddata", onLoaded);
     return () => {
-      sv.removeEventListener("seeked", onFrame);
-      sv.removeEventListener("loadeddata", onFrame);
+      sv.removeEventListener("seeked", onSeeked);
+      sv.removeEventListener("loadeddata", onLoaded);
     };
   }, [paint, playing, ready]);
 
@@ -249,8 +230,15 @@ export default function Editor() {
       if (!project) return;
       const t = Math.max(project.trim.startMs, Math.min(project.trim.endMs, ms));
       setPlayhead(t);
+      // Re-anchor the play clock so a mid-play scrub takes effect instantly in
+      // BOTH directions (the slew + monotonic clamp otherwise resist it).
+      // While paused this is harmless — the play effect re-anchors on start.
+      playClockRef.current = { anchorPerf: performance.now(), anchorMs: t, lastT: t };
       const sv = screenVideoRef.current;
-      if (sv) sv.currentTime = t / 1000;
+      if (sv) {
+        seekPendingRef.current = true;
+        sv.currentTime = t / 1000;
+      }
       const cv = camVideoRef.current;
       if (cv) cv.currentTime = Math.max(0, (t - project.camera.offsetMs) / 1000);
       const ma = micAudioRef.current;
@@ -274,18 +262,25 @@ export default function Editor() {
     void cv?.play().catch(() => {});
     void ma?.play().catch(() => {});
 
-    const clock: PlayClock = {
+    playClockRef.current = {
       anchorPerf: performance.now(),
       anchorMs: playheadRef.current,
       lastT: playheadRef.current,
     };
     let raf = 0;
+    let lastPub = 0;
 
     const loop = () => {
       const now = performance.now();
       // Slewed, monotonic playhead — see tickPlayClock (timeline.ts) for why
-      // this must never hard-snap backward to a lagging video clock.
-      const t = tickPlayClock(clock, now, sv ? sv.currentTime * 1000 : null);
+      // this must never hard-snap backward to a lagging video clock. Read the
+      // ref FRESH each tick (seek() re-anchors by replacing the object) and
+      // ignore the video clock while one of our own seeks is still landing.
+      const t = tickPlayClock(
+        playClockRef.current,
+        now,
+        seekPendingRef.current ? null : sv ? sv.currentTime * 1000 : null,
+      );
 
       if (t >= project.trim.endMs) {
         setPlaying(false);
@@ -301,6 +296,7 @@ export default function Editor() {
       const cutEnd = cutEndAt(project.cuts, t);
       if (cutEnd != null && cutEnd < project.trim.endMs) {
         if (sv) {
+          seekPendingRef.current = true;
           sv.currentTime = cutEnd / 1000;
           void sv.play().catch(() => {});
         }
@@ -312,10 +308,9 @@ export default function Editor() {
           ma.currentTime = Math.max(0, (cutEnd - project.audio.offsetMs) / 1000);
           void ma.play().catch(() => {});
         }
-        clock.anchorPerf = now;
-        clock.anchorMs = cutEnd;
-        clock.lastT = cutEnd;
-        setPlayhead(cutEnd);
+        playClockRef.current = { anchorPerf: now, anchorMs: cutEnd, lastT: cutEnd };
+        lastPub = now;
+        setPlayhead(cutEnd); // discontinuity — publish immediately
         raf = requestAnimationFrame(loop);
         return;
       }
@@ -332,7 +327,14 @@ export default function Editor() {
         }
       }
 
-      setPlayhead(t);
+      // Hot path: the renderer reads the REF at full rate (smooth zoom/pan);
+      // React state (Timeline/Playhead/Transport) publishes at ~30Hz — a full
+      // unmemoized tree re-render per rAF was the editor's frame-rate killer.
+      playheadRef.current = t;
+      if (now - lastPub >= 33) {
+        lastPub = now;
+        setPlayheadMsState(t);
+      }
       paint();
       raf = requestAnimationFrame(loop);
     };
@@ -342,6 +344,8 @@ export default function Editor() {
       sv?.pause();
       cv?.pause();
       ma?.pause();
+      // Settle the drawn playhead exactly where playback actually stopped.
+      setPlayheadMsState(playheadRef.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [playing, project]);
@@ -530,7 +534,7 @@ export default function Editor() {
         <Card className="flex h-full w-80 flex-col gap-0 rounded-none border-y-0 border-r-0 py-0">
           <ScrollArea className="min-h-0 flex-1">
             <Inspector
-              playheadMs={playheadMs}
+              playheadRef={playheadRef}
               onSeek={seek}
               selectedKeyframe={selectedKeyframe}
               onSelectKeyframe={setSelectedKeyframe}

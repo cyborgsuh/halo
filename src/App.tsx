@@ -1,6 +1,7 @@
 import { useEffect, useMemo } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { Loader2, Minus, Square, X } from "lucide-react";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Toaster } from "@/components/ui/sonner";
@@ -41,11 +42,12 @@ function WindowControls() {
   );
 }
 import Dashboard from "@/components/Dashboard";
-import Recorder from "@/components/Recorder";
+import Recorder, { finalizeStop } from "@/components/Recorder";
 import Editor from "@/components/Editor";
 import RecBar from "@/components/RecBar";
 import CamPreview from "@/components/CamPreview";
 import { useAppStore, type AppView } from "@/store";
+import type { StopRecordingResult } from "@/lib/capture";
 
 // ── Window routing ───────────────────────────────────────────────────────────
 // The floating recording bar is a SEPARATE Tauri window (label "rec-bar") that
@@ -104,12 +106,29 @@ export default function App() {
   const loadRecordings = useAppStore((s) => s.loadRecordings);
   const recStatus = useAppStore((s) => s.recording.status);
   const processing = recStatus === "stopping" || recStatus === "processing";
+  // Lock nav while a recording is starting/active/finalizing — leaving the
+  // Recorder mid-session orphans the countdown UI and confuses the stop flow.
+  const navLocked = recStatus !== "idle";
 
   // Populate the library on first paint of the main app.
   useEffect(() => {
     if (isOverlay) return;
     void loadRecordings();
   }, [isOverlay, loadRecordings]);
+
+  // Finalize stops at APP level (never unmounts). The Recorder view can be
+  // unmounted mid-recording (user navigates to the library), and the bar's
+  // "recording-stopped" event must still build the project + land on the editor.
+  useEffect(() => {
+    if (isOverlay) return;
+    let un: UnlistenFn | undefined;
+    void listen<StopRecordingResult | null>("recording-stopped", (e) => {
+      void finalizeStop(e.payload);
+    }).then((u) => {
+      un = u;
+    });
+    return () => un?.();
+  }, [isOverlay]);
 
   // Overlay windows (rec-bar pill, cam-preview circle) are transparent — clear
   // the opaque body bg that index.css applies globally, or it shows as a square.
@@ -154,7 +173,7 @@ export default function App() {
         >
           <button
             type="button"
-            onClick={() => setView("dashboard")}
+            onClick={() => !navLocked && setView("dashboard")}
             className="mr-auto flex items-center gap-2 rounded-md text-sm font-semibold tracking-tight outline-none transition-opacity hover:opacity-80 focus-visible:ring-2 focus-visible:ring-ring"
           >
             <span className="inline-block size-2 rounded-full bg-primary" aria-hidden />
@@ -165,6 +184,7 @@ export default function App() {
             <Button
               variant="ghost"
               size="sm"
+              disabled={navLocked}
               onClick={() => setView("dashboard")}
               className="text-muted-foreground hover:text-foreground"
             >

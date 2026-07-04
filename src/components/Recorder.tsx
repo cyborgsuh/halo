@@ -11,7 +11,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { emit } from "@tauri-apps/api/event";
 import { AnimatePresence } from "framer-motion";
 import { toast } from "sonner";
 import { Camera, FolderOpen, Mic, MicOff, Monitor, Square, Video } from "lucide-react";
@@ -49,7 +49,7 @@ import {
   type Project,
   type ZoomRegion,
 } from "@/lib/timeline";
-import { computeZoomRegions, type CursorSample } from "@/lib/autozoom";
+import { computeZoomRegions, parseCursorLog } from "@/lib/autozoom";
 import {
   getCamStream,
   listMonitors,
@@ -64,24 +64,6 @@ import {
   type StartRecordingResult,
   type StopRecordingResult,
 } from "@/lib/capture";
-
-/** Parse cursor.jsonl (one JSON object per line) into cursor samples. */
-function parseCursorLog(text: string): CursorSample[] {
-  const out: CursorSample[] = [];
-  for (const line of text.split("\n")) {
-    const s = line.trim();
-    if (!s) continue;
-    try {
-      const o = JSON.parse(s) as CursorSample;
-      if (typeof o.t === "number" && typeof o.x === "number" && typeof o.y === "number") {
-        out.push(o);
-      }
-    } catch {
-      /* skip malformed line */
-    }
-  }
-  return out;
-}
 
 /**
  * Load cursor.jsonl and derive auto-zoom keyframes. Best-effort: any failure
@@ -154,6 +136,98 @@ function fmtElapsed(ms: number): string {
   const s = Math.floor(ms / 1000);
   const m = Math.floor(s / 60);
   return `${String(m).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+}
+
+// ── Session-finalization state — MODULE scope, not component refs ───────────
+// The Recorder view can unmount mid-recording (user navigates to the library),
+// so the stop flow must not live in component state. The "recording-stopped"
+// listener is registered ONCE at App level and calls finalizeStop below.
+
+/** tracks what a/v the active session records so stop knows whether to flush */
+let capturedAv = false;
+/** wall ms from the capture clock's start to when real content begins */
+let contentStartMs = 0;
+/** latch so the recording-stopped flow finalizes exactly once per session */
+let finalizing = false;
+
+/**
+ * Finalize a stopped recording: flush mic/cam, run auto-zoom, build the project,
+ * refresh the library and land on the editor. Driven by the "recording-stopped"
+ * event (emitted by the floating bar or by requestStop), guarded to run once.
+ * Module-level + store-via-getState so it works no matter which view is mounted.
+ */
+export async function finalizeStop(
+  stopRes: StopRecordingResult | null,
+): Promise<void> {
+  if (finalizing) return;
+  finalizing = true;
+  const { setRecording, setProject, resetRecording, loadRecordings, setView } =
+    useAppStore.getState();
+
+  // Hide the floating camera preview + release its camera (device key gate).
+  writeCamPreviewDevice(null);
+  try {
+    await invoke("close_cam_preview");
+  } catch {
+    /* not open */
+  }
+
+  // Bring the main window back regardless of how stop was triggered.
+  try {
+    const win = getCurrentWindow();
+    await win.unminimize();
+    await win.setFocus();
+  } catch (e) {
+    console.warn("restore window failed", e);
+  }
+  clearRecBarSession();
+
+  if (!stopRes) {
+    // Stop failed on the bar side — recover to an editable/idle state.
+    capturedAv = false;
+    resetRecording();
+    toast.error("Recording stopped unexpectedly.");
+    return;
+  }
+
+  setRecording({ status: "stopping" });
+  try {
+    let cap: CaptureResult = {};
+    if (capturedAv) {
+      try {
+        cap = await stopCapture(stopRes.dir);
+      } catch (e) {
+        console.warn("capture stop failed", e);
+      }
+    }
+    capturedAv = false;
+
+    setRecording({ status: "processing", dir: stopRes.dir });
+    const zoom = await autoZoomFor(stopRes);
+    // Trim the countdown bit exactly: content-start (wall ms from clock start)
+    // minus the capture lag (clock start → first video frame) = video time
+    // where the user's content begins.
+    const trimStartMs = Math.max(0, contentStartMs - (stopRes.captureLagMs ?? 0));
+    const project = makeProject(stopRes, cap, zoom, trimStartMs);
+    setProject(project);
+    resetRecording();
+    setView("edit"); // navigate FIRST so stop always lands on the editor
+
+    // Persist + refresh library in the background (must not block navigation).
+    const id = stopRes.dir.split(/[\\/]/).filter(Boolean).pop() ?? "";
+    if (id) {
+      try {
+        await invoke("save_project", { id, json: JSON.stringify(project) });
+      } catch (e) {
+        console.warn("save_project failed", e);
+      }
+    }
+    void loadRecordings();
+    toast.success("Recording ready — refine it in the editor.");
+  } catch (e) {
+    setRecording({ status: "idle", error: String(e) });
+    toast.error("Stop failed: " + String(e));
+  }
 }
 
 interface RecordingFiles {
@@ -264,15 +338,8 @@ export default function Recorder() {
   const [showCountdown, setShowCountdown] = useState(false);
 
   const camVideoRef = useRef<HTMLVideoElement | null>(null);
-  // tracks what a/v the active session is recording so we know whether to stop capture
-  const capturedAvRef = useRef(false);
-  // latch so the recording-stopped flow finalizes exactly once
-  const finalizingRef = useRef(false);
   // WGC start kicked off at countdown START so it's warm by the time it hits 0.
   const startPromiseRef = useRef<Promise<StartRecordingResult> | null>(null);
-  // Wall ms from the capture clock's start to the moment real content begins (i.e.
-  // after the countdown + minimize). Minus captureLag → exact video-time trim point.
-  const contentStartRef = useRef(0);
 
   const isRecording = recording.status === "recording";
   const isBusy = recording.status === "starting" || recording.status === "stopping";
@@ -432,10 +499,10 @@ export default function Recorder() {
       const startedAtMs = Date.now();
       // Content begins NOW (countdown done, app hidden). Record where that lands on
       // the capture clock so finalizeStop can trim the countdown bit exactly.
-      contentStartRef.current = Math.max(0, startedAtMs - res.startEpochMs);
+      contentStartMs = Math.max(0, startedAtMs - res.startEpochMs);
       writeRecBarSession({ sessionId: res.sessionId, startedAtMs });
 
-      finalizingRef.current = false;
+      finalizing = false;
       setRecording({
         status: "recording",
         sessionId: res.sessionId,
@@ -444,8 +511,8 @@ export default function Recorder() {
       });
       await emit("rec-bar-session-ready", { sessionId: res.sessionId, startedAtMs });
 
-      capturedAvRef.current = recording.captureMic || recording.captureCam;
-      if (capturedAvRef.current) {
+      capturedAv = recording.captureMic || recording.captureCam;
+      if (capturedAv) {
         try {
           await startCapture({
             startEpochMs: res.startEpochMs,
@@ -456,14 +523,14 @@ export default function Recorder() {
           });
         } catch (e) {
           console.warn("a/v capture failed", e);
-          capturedAvRef.current = false;
+          capturedAv = false;
           toast.warning("Mic/camera unavailable — recording screen only", {
             description: "Check device permissions. The screen capture continues.",
           });
         }
       }
     } catch (e) {
-      capturedAvRef.current = false;
+      capturedAv = false;
       startPromiseRef.current = null;
       clearRecBarSession();
       writeCamPreviewDevice(null);
@@ -488,87 +555,9 @@ export default function Recorder() {
   }, [recording, devices, setRecording]);
 
   // ── stop / finalize ──
-
-  /**
-   * Finalize a stopped recording: flush mic/cam, run auto-zoom, build the project,
-   * refresh the library and land on the editor. Driven by the "recording-stopped"
-   * event (emitted by the floating bar or by requestStop here), guarded to run once.
-   */
-  const finalizeStop = useCallback(
-    async (stopRes: StopRecordingResult | null) => {
-      if (finalizingRef.current) return;
-      finalizingRef.current = true;
-
-      // Hide the floating camera preview + release its camera (device key gate).
-      writeCamPreviewDevice(null);
-      try {
-        await invoke("close_cam_preview");
-      } catch {
-        /* not open */
-      }
-
-      // Bring the main window back regardless of how stop was triggered.
-      try {
-        const win = getCurrentWindow();
-        await win.unminimize();
-        await win.setFocus();
-      } catch (e) {
-        console.warn("restore window failed", e);
-      }
-      clearRecBarSession();
-
-      if (!stopRes) {
-        // Stop failed on the bar side — recover to an editable/idle state.
-        capturedAvRef.current = false;
-        resetRecording();
-        toast.error("Recording stopped unexpectedly.");
-        return;
-      }
-
-      setRecording({ status: "stopping" });
-      try {
-        let cap: CaptureResult = {};
-        if (capturedAvRef.current) {
-          try {
-            cap = await stopCapture(stopRes.dir);
-          } catch (e) {
-            console.warn("capture stop failed", e);
-          }
-        }
-        capturedAvRef.current = false;
-
-        setRecording({ status: "processing", dir: stopRes.dir });
-        const zoom = await autoZoomFor(stopRes);
-        // Trim the countdown bit exactly: content-start (wall ms from clock start)
-        // minus the capture lag (clock start → first video frame) = video time
-        // where the user's content begins.
-        const trimStartMs = Math.max(
-          0,
-          contentStartRef.current - (stopRes.captureLagMs ?? 0),
-        );
-        const project = makeProject(stopRes, cap, zoom, trimStartMs);
-        setProject(project);
-        resetRecording();
-        setView("edit"); // navigate FIRST so stop always lands on the editor
-
-        // Persist + refresh library in the background (must not block navigation).
-        const id = stopRes.dir.split(/[\\/]/).filter(Boolean).pop() ?? "";
-        if (id) {
-          try {
-            await invoke("save_project", { id, json: JSON.stringify(project) });
-          } catch (e) {
-            console.warn("save_project failed", e);
-          }
-        }
-        void loadRecordings();
-        toast.success("Recording ready — refine it in the editor.");
-      } catch (e) {
-        setRecording({ status: "idle", error: String(e) });
-        toast.error("Stop failed: " + String(e));
-      }
-    },
-    [setRecording, setProject, resetRecording, loadRecordings, setView],
-  );
+  // finalizeStop is MODULE-level (top of file) and its "recording-stopped"
+  // listener lives in App.tsx — stop must finalize even when this view is
+  // unmounted (user navigated to the library mid-recording).
 
   /** Local stop fallback (e.g. main window restored): mirror the bar's stop sequence. */
   const requestStop = useCallback(async () => {
@@ -589,17 +578,6 @@ export default function Recorder() {
       }
     }
   }, [setRecording]);
-
-  // The main window observes the bar's stop and finalizes the recording.
-  useEffect(() => {
-    let unlisten: UnlistenFn | undefined;
-    void listen<StopRecordingResult | null>("recording-stopped", (e) => {
-      void finalizeStop(e.payload);
-    }).then((u) => {
-      unlisten = u;
-    });
-    return () => unlisten?.();
-  }, [finalizeStop]);
 
   const openLast = useCallback(async () => {
     try {

@@ -8,7 +8,7 @@
 // the global zoom-speed + cursor-follow motion. playhead/selection are owned by
 // Editor and passed in; the Export button frame-steps the live renderer.
 
-import { useRef, useState } from "react";
+import { memo, useRef, useState } from "react";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
@@ -38,9 +38,14 @@ import { useAppStore } from "@/store";
 import { DEFAULT_ZOOM_DURATION_MS } from "@/lib/timeline";
 import { exportProject, AbortError } from "@/lib/export";
 import { createMp4Demuxer } from "@/lib/mp4demuxer";
+import { cursorPathFor, parseCursorLog, type CursorSample } from "@/lib/autozoom";
+import { readTextFile } from "@/lib/capture";
 
 export interface InspectorProps {
-  playheadMs: number;
+  /** Live playhead as a REF, not state — the panel must not re-render per
+   *  frame (it renders nothing from the playhead); the single use is
+   *  read-at-click-time for "Add zoom at playhead". */
+  playheadRef: { readonly current: number };
   onSeek: (ms: number) => void;
   selectedKeyframe: number | null;
   onSelectKeyframe: (i: number | null) => void;
@@ -110,7 +115,7 @@ function num(v: number | readonly number[]): number {
   return Array.isArray(v) ? v[0] : (v as number);
 }
 
-export default function Inspector(props: InspectorProps) {
+function Inspector(props: InspectorProps) {
   const project = useAppStore((s) => s.project);
   const updateBackground = useAppStore((s) => s.updateBackground);
   const updateCamera = useAppStore((s) => s.updateCamera);
@@ -171,11 +176,23 @@ export default function Inspector(props: InspectorProps) {
       const camBlob = project.camera.file
         ? await (await fetch(convertFileSrc(project.camera.file))).blob()
         : null;
+      // Cursor path drives the pan-follow in the export renderer — without it
+      // exported zooms are centered instead of tracking the mouse. Best-effort:
+      // a missing cursor.jsonl still exports (just no pan).
+      let cursor: CursorSample[] | undefined;
+      try {
+        cursor = parseCursorLog(
+          await readTextFile(cursorPathFor(project.source.screen)),
+        );
+      } catch {
+        /* no cursor log — export without pan */
+      }
 
       const out = await exportProject({
         project,
         source: { blob: srcBlob, demuxer: createMp4Demuxer() },
         camera: camBlob ? { blob: camBlob } : null,
+        cursor,
         audioPath: project.audio.mic || null,
         outPath,
         signal: ac.signal,
@@ -435,7 +452,7 @@ export default function Inspector(props: InspectorProps) {
                 size="sm"
                 variant="outline"
                 onClick={() => {
-                  addZoomRegion(props.playheadMs);
+                  addZoomRegion(props.playheadRef.current);
                   props.onSelectKeyframe(regionCount);
                 }}
               >
@@ -698,3 +715,8 @@ export default function Inspector(props: InspectorProps) {
     </div>
   );
 }
+
+// memo is load-bearing: without it the panel (Tabs, sliders, swatches) fully
+// re-renders on every Editor state tick during playback. All props are
+// referentially stable across playhead ticks (ref + stable callbacks).
+export default memo(Inspector);
